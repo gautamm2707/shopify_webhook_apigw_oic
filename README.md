@@ -60,9 +60,6 @@ The external webhook caller does not need to know the OIC scope, client secret, 
 ```text
 func.py              OCI Function handler
 requirements.txt    Python dependencies
-func.yaml           OCI Functions metadata
-Dockerfile          Container image build file
-.dockerignore       Docker build exclusions
 ```
 
 ## Required OCI Configuration
@@ -76,12 +73,13 @@ idcs_app_client_id=<identity-domain-oauth-client-id>
 idcs_client_secret_ocid=<oci-vault-secret-ocid>
 idcs_token_endpoint=https://<identity-domain>.identity.oraclecloud.com/oauth2/v1/token
 idcs_oauth_scope=https://<oic-host>:443urn:opc:resource:consumer::all
+OIC_ENDPOINT=https://<oic-host>/ic/api/integration/v2/flows/rest/<integration-endpoint>
 ```
 
 Recommended function-level config:
 
 ```text
-OIC_ENDPOINT=https://<oic-host>/ic/api/integration/v2/flows/rest/<integration-endpoint>
+Avoid Hardcoding
 ```
 
 The code also supports these alternate config names:
