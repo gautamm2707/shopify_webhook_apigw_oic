@@ -2,6 +2,8 @@ import io
 import json
 import logging
 import base64
+import hashlib
+import hmac
 from typing import Any, Dict, Optional
 
 import oci
@@ -20,6 +22,8 @@ CONFIG = {}
 # OIC_ENDPOINT=https://<oic-instance>.integration.<region>.ocp.oraclecloud.com/ic/api/integration/v1/flows/rest/<endpoint>
 # CLIENT_ID=<identity-domain-oauth-client-id>
 # CLIENT_SECRET_OCID=<oci-vault-secret-ocid-containing-client-secret>
+# SHOPIFY_SECRET=<oci-vault-secret-ocid-containing-shopify-webhook-secret>
+# OIC_HTTP_METHOD=GET or POST
 #
 DEFAULT_TOKEN_URL = "https://idcs-ff3532e3a9ba4###########.identity.oraclecloud.com/oauth2/v1/token"
 DEFAULT_OIC_SCOPE = "https://01DB8CF84FDB4C##############.integration.us-ashburn-1.ocp.oraclecloud.com:443urn:opc:resource:consumer::all"
@@ -80,6 +84,39 @@ def _build_basic_auth_header(client_id: str, client_secret: str) -> str:
     encoded = f"{client_id}:{client_secret}"
     baseencoded = base64.urlsafe_b64encode(encoded.encode("UTF-8")).decode("ascii")
     return f"Basic {baseencoded}"
+
+
+def _verify_shopify_hmac(raw_body: bytes, webhook_secret: str, received_hmac: str) -> bool:
+    digest = hmac.new(
+        webhook_secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).digest()
+    calculated_hmac = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(calculated_hmac, received_hmac)
+
+
+def _validate_shopify_webhook(request_headers: Dict[str, str], raw_body: bytes) -> None:
+    shopify_secret_ocid = _get_config(
+        "SHOPIFY_SECRET",
+        "",
+        "SHOPIFY_SECRET_OCID",
+        "shopify_secret_ocid",
+    )
+
+    if not shopify_secret_ocid:
+        LOGGER.error("SHOPIFY_SECRET is not configured")
+        raise PermissionError("SHOPIFY_SECRET is not configured")
+
+    received_hmac = _get_header(request_headers, "X-Shopify-Hmac-Sha256")
+    if not received_hmac:
+        LOGGER.warning("Missing Shopify HMAC header")
+        raise PermissionError("Missing Shopify HMAC header")
+
+    webhook_secret = getSecret(shopify_secret_ocid)
+    if not _verify_shopify_hmac(raw_body, webhook_secret, received_hmac):
+        LOGGER.warning("Invalid Shopify HMAC signature")
+        raise PermissionError("Invalid Shopify HMAC signature")
 
 
 def _get_jwt_assertion() -> Optional[str]:
@@ -144,10 +181,14 @@ def handler(ctx, data: io.BytesIO = None):
         LOGGER.info("handler: started function execution")
 
         request_headers = ctx.Headers() or {}
+        raw_body = data.getvalue() if data else b""
+        _validate_shopify_webhook(request_headers, raw_body)
+
         token_url = _get_config("TOKEN_URL", DEFAULT_TOKEN_URL, "idcs_token_endpoint")
         oic_scope = _get_config("OIC_SCOPE", DEFAULT_OIC_SCOPE, "idcs_oauth_scope")
         oic_endpoint = _get_config("OIC_ENDPOINT", DEFAULT_OIC_ENDPOINT, "OIC_Endpoint", "oic_endpoint")
         grant_type = _get_config("TOKEN_GRANT_TYPE", DEFAULT_TOKEN_GRANT_TYPE, "idcs_token_grant_type")
+        oic_http_method = _get_config("OIC_HTTP_METHOD", "GET", "oic_http_method").upper()
         client_id = _get_required_config("CLIENT_ID", "idcs_app_client_id")
         client_secret_ocid = _get_required_config("CLIENT_SECRET_OCID", "idcs_client_secret_ocid")
         client_secret = getSecret(client_secret_ocid)
@@ -173,16 +214,33 @@ def handler(ctx, data: io.BytesIO = None):
             "X-Shopify-Hmac-Sha256",
             "X-Shopify-Triggered-At",
             "X-Shopify-Event-Id",
+            "X-Shopify-API-Version",
         ):
             header_value = _get_header(request_headers, header_name)
             if header_value:
                 oic_headers[header_name] = header_value
 
-        oic_response = requests.get(
-            oic_endpoint,
-            headers=oic_headers,
-            timeout=30,
-        )
+        if oic_http_method == "GET":
+            oic_response = requests.get(
+                oic_endpoint,
+                headers=oic_headers,
+                timeout=30,
+            )
+        elif oic_http_method == "POST":
+            content_type = _get_header(request_headers, "Content-Type") or "application/json"
+            oic_headers["Content-Type"] = content_type
+            oic_response = requests.post(
+                oic_endpoint,
+                headers=oic_headers,
+                data=raw_body,
+                timeout=30,
+            )
+        else:
+            return _json_response(
+                ctx,
+                500,
+                {"error": f"Unsupported OIC_HTTP_METHOD: {oic_http_method}"},
+            )
 
         return response.Response(
             ctx,
@@ -196,6 +254,8 @@ def handler(ctx, data: io.BytesIO = None):
     except requests.Timeout:
         LOGGER.exception("Timeout while calling downstream service")
         return _json_response(ctx, 504, {"error": "Timeout while calling downstream service"})
+    except PermissionError as ex:
+        return _json_response(ctx, 401, {"error": str(ex)})
     except Exception as ex:
         LOGGER.exception("Exception occurred")
         return _json_response(ctx, 500, {"error": str(ex)})
